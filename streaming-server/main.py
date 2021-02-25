@@ -1,194 +1,155 @@
 #!/usr/bin/env python3
 
 import asyncio
+import sys
+import logging
+from threading import Thread
+from asyncio.streams import StreamReader, StreamWriter
 
 from datetime import datetime
+from typing import Dict
 
-# Global to handle pause
-PAUSED = False
-CONNECTED = False
+logger = logging.getLogger(__file__)
+logger.level = logging.DEBUG
+logger.addHandler(logging.StreamHandler(sys.stdout))
 
-STREAM_TYPES = ["acc", "bvp", "gsr", "ibi", "tmp", "bat", "tag", "hr"]
 
-# Constants for data subscriptions
-freq_64 = 15.625 / 1000.0
-freq_32 = freq_64 * 2.0
-freq_4  = 250 / 1000.0
-
-class Subscription:
-    enabled = False
-    freq = 0
-    label = ""
-    type = ""
-    value = 0
-    last_send = 0
-
-    def __init__(self, l, t, fr, val):
-        self.freq = fr
+class Stream:
+    def __init__(self, l: str, t: str, fr: float, val: list, paused: bool = True):
         self.label = l
-        self.value = val
         self.type = t
+        self.freq = fr or 0.1
+        self.value = val
+        self.last_send = 0.0
+        self.paused = paused
 
-    def send(self):
-        # TODO:
-        # -- Ask about heart rate and IBI frequencies
-        # -- Add simulation for button press freq values?
-        if self.freq > 0.0:
-            if now() - self.last_send > self.freq:
-                if self.type == "acc":
-                    val = " "
-                    for i in self.value:
-                        val += " " + str(i)
-                    return self.label + " " + str(now()) + val + "\n"
-                else:
-                    return self.label + " " + str(now()) + " " + str(self.value) + "\n"
-            else:
-                return None
+    async def read(self):
+        while True:
+            t = now()
+            if not self.paused and (t - self.last_send) > 1 / self.freq:
+                self.last_send = t
+                yield f"{self.label} {t} {' '.join(map(str, self.value))}"
+            await asyncio.sleep(1 / self.freq)
 
-    def enable(self):
-        self.enabled = True
+    def pause(self):
+        self.paused = True
 
-    def disable(self):
-        self.enabled = False
+    def resume(self):
+        self.paused = False
 
 
-class Subscriptions_Holder:
-    streams = [Subscription("E4_Acc", "acc", freq_32, [100, 200, 300]),
-    Subscription("E4_Bvp", "bvp", freq_64, 400),
-    Subscription("E4_Ibi", "ibi", 0, 500),
-    Subscription("E4_Gsr", "gsr", freq_4,  600),
-    Subscription("E4_Temperature", "tmp", freq_4, 700),
-    Subscription("E4_Hr", "hr", 0, 800),
-    Subscription("E4_Bat", "bat", 0, 1.0),
-    Subscription("E4_Tag", "tag", 0, 1000)]
+class StreamHolder:
 
-    def enable(self, t):
-        for i in self.streams:
-            if i.type == t or i.type == t.lower():
-                i.enable()
+    def __init__(self) -> None:
+        self.streams: Dict[str, Stream] = {
+            "acc": Stream("E4_Acc", "acc", 32, [100, 200, 300]),
+            "bvp": Stream("E4_Bvp", "bvp", 64, [400]),
+            "ibi": Stream("E4_Ibi", "ibi", 0, [500]),
+            "gsr": Stream("E4_Gsr", "gsr", 4,  [600]),
+            "tmp": Stream("E4_Temperature", "tmp", 4, [700]),
+            "hr": Stream("E4_Hr", "hr", 0, [800]),
+            "bat": Stream("E4_Bat", "bat", 0, [1.0]),
+            "tag": Stream("E4_Tag", "tag", 0, [1000])
+        }
+        self.is_paused = False
 
-    def disable(self, t):
-        for i in self.streams:
-            if i.type == t or i.type == t.lower():
-                i.disable()
+    def resume_all(self):
+        for stream_id in self.streams:
+            self.streams[stream_id].resume()
+        self.is_paused = False
 
-    def send_enabled(self):
-        payload = []
-        tmp = ""
-        for i in self.streams:
-            if i.enabled and not PAUSED:
-                tmp = i.send()
-                if tmp:
-                    payload.append(i.send())
-                    tmp = ""
-        return payload
+    def pause_all(self):
+        for stream_id in self.streams:
+            self.streams[stream_id].pause()
+        self.is_paused = True
 
-STREAMS = Subscriptions_Holder()
+    def paused(self) -> bool:
+        return self.is_paused
 
-# Helper function to generate timestamps in EE4 format
+    @staticmethod
+    async def __task__(s: Stream, w: StreamWriter):
+        async for data in s.read():
+            w.write(f"{data}\r\n".encode())
+
+    def new_streaming_loop(self, w: StreamWriter):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        tasks = []
+        for stream_id in self.streams:
+            tasks.append(loop.create_task(self.__task__(self.streams[stream_id], w)))
+        loop.run_forever()
+
+
 def now():
+    '''Helper function to generate timestamps in EE4 format'''
     return datetime.now().timestamp()
 
-def cmd_handler(command_raw):
-    global PAUSED
-    global CONNECTED
-    global STREAMS
 
-    # Empty string for testing
-    s = ""
-
-    # Temp variable
-    t = command_raw.split()
-
-    # If t does not exist, or command_raw empty, return empty
-    if not t:
+def cmd_handler(msg: str) -> str:
+    # If msg does not exist, or cmd empty, return empty
+    if not msg:
         return ""
 
-    cmd = t[0].strip()
-    args = command_raw.split()[1:]
-    
-    if(cmd == "device_list"):
-        return "R device_list 2 | 9ff167 Empatica_E4 | 7a3166 Empatica_E4\n"
-    elif(cmd == "device_connect"):
-        # TODO: add more behavior
-        CONNECTED = True
-        return "R device_connect OK\n"
+    msg_parts = msg.split()
+    cmd, args = msg_parts[0], msg_parts[1:]
 
-    elif(cmd == "device_subscribe"):
-        #TODO: add class for subscribed streams
-        # --IN PROGRESS--
+    if (cmd == "device_list"):
+        return "R device_list 2 | 9ff167 Empatica_E4 | 7a3166 Empatica_E4"
+
+    if (cmd == "device_connect"):
+        return "R device_connect OK"
+
+    if (cmd == "device_subscribe"):
         if len(args) > 2:
-            return "R device_subscribe ERR too many arguments\n"
-        for stream in STREAM_TYPES:
-            if args[0] == stream or args[0] == stream.upper():
-                sub = args[0].lower()
-                STREAMS.enable(sub)
-                return "R " + cmd + " " + s.join(args) + " OK\n"
+            return "R device_subscribe ERR too many arguments"
+        sub = args[0].lower()
+        if sub in STREAM_TYPES:
+            return f"R {cmd} {sub} OK"
 
-    elif(cmd == "pause"):
+    if (cmd == "pause"):
         if len(args) > 1:
-            return "R pause ERR too many arguments\n"
+            return "R pause ERR too many arguments"
         else:
-            if args[0] == "ON" or args[0] == "on":
-                if PAUSED:
-                    return "R pause ERR already paused\n"
-                PAUSED = True
-                return "R pause ON\n"
-            elif args[0] == "OFF" or args[0] == "off":
-                if not PAUSED:
-                    return "R pause ERR not paused\n"
-                PAUSED = False
-                return "R pause OFF\n"
+            if args[0].upper() == "ON":
+                if STREAMS.paused():
+                    return "R pause ERR already paused"
+                STREAMS.pause_all()
+                return "R pause ON"
+            elif args[0].upper() == "OFF":
+                if not STREAMS.paused():
+                    return "R pause ERR not paused"
+                STREAMS.resume_all()
+                return "R pause OFF"
             else:
-                return "R pause ERR wrong argument\n"
+                return "R pause ERR wrong argument"
 
-    else:
-        return ""
+    return ""
 
-async def reader(r):
+
+async def ee4_srv(r: StreamReader, w: StreamWriter):
+    thread = Thread(target=STREAMS.new_streaming_loop, args=(w,))
+    thread.start()
     while True:
-        a = r.read(100)
-        print(a)
-    return a
-
-async def ee4_srv(r,w):
-    while True:
-        msg_raw = await reader(r)
-        
         try:
-            msg = msg_raw.decode()
-            w.write(cmd_handler(msg).encode())
+            msg_raw = await r.readline()
+            msg = msg_raw.decode().strip()
+            logger.info(f"< {msg}")
+            out = cmd_handler(msg)
+            logger.info(f"> {out}")
+            w.write(f"{out}\r\n".encode())
+            await w.drain()
         except UnicodeDecodeError:
-            print("invalid char sent")
+            logger.warn("invalid char found")
+            break
         except AttributeError:
-            continue
-        
-        await subscription_updater(w)
+            logger.warn("attribute error found")
+            break
 
-        #w.drain()
-
-        # TODO: Move to coroutine
-        #stream_data = STREAMS.send_enabled()
-
-        #print(stream_data)
-
-        #if stream_data:
-        #    for i in stream_data:
-        #        w.write(i.encode())
-
-    w.close()
-    
-async def subscription_updater(w):
-    stream_data = STREAMS.send_enabled()
-    
-    if stream_data:
-            for i in stream_data:
-                w.write(i.encode())
 
 async def main():
     srv = await asyncio.start_server(ee4_srv, '127.0.0.1', 28000)
-    print("Server started!")
-
+    host, port = srv.sockets[0].getsockname()
+    logger.info(f"Streaming server started on {host}:{port}!")
     try:
         async with srv:
             await srv.serve_forever()
@@ -197,9 +158,11 @@ async def main():
 
 # For testing...
 if (__name__ == "__main__"):
+    # Global to handle streaming
+    STREAMS = StreamHolder()
+    STREAM_TYPES = ["acc", "bvp", "gsr", "ibi", "tmp", "bat", "tag", "hr"]
     # In try-except to suppress irrelevant errors
     try:
-        asyncio.run(main())
+        asyncio.run(main(), debug=True)
     except KeyboardInterrupt:
         exit(0)
-
