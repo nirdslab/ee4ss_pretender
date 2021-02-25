@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
 
+"""
+Mock E4 Streaming Server
+Source: git@github.com:nirdslab/ee4ss_pretender.git
+
+@author: Ben Mabe, Yasith Jayawardana
+
+"""
+
 import asyncio
 import sys
 import logging
@@ -14,22 +22,17 @@ logger.level = logging.DEBUG
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
-def now():
-    '''Helper function to generate timestamps in EE4 format'''
-    return datetime.now().timestamp()
-
-
 class Stream:
-    def __init__(self, l: str, t: str, fr: float, val: list):
-        self.label = l
-        self.type = t
-        self.freq = fr or 0.1
-        self.value = val
+    def __init__(self, label: str, typ: str, freq: float, default_v: list):
+        self.label = label
+        self.typ = typ
+        self.freq = freq or 0.1
+        self.value = default_v
         self.last_t = 0.0
         self.last_v = None
 
     def read_latest(self):
-        t = now()
+        t = datetime.now().timestamp()
         if (t - self.last_t) > 1 / self.freq:
             self.last_t = t
             self.last_v = ' '.join(map(str, self.value))
@@ -41,7 +44,7 @@ STREAMS: Dict[str, Stream] = {
     "acc": Stream("E4_Acc", "acc", 32, [100, 200, 300]),
     "bvp": Stream("E4_Bvp", "bvp", 64, [400]),
     "ibi": Stream("E4_Ibi", "ibi", 0, [500]),
-    "gsr": Stream("E4_Gsr", "gsr", 4,  [600]),
+    "gsr": Stream("E4_Gsr", "gsr", 4, [600]),
     "tmp": Stream("E4_Temperature", "tmp", 4, [700]),
     "hr": Stream("E4_Hr", "hr", 0, [800]),
     "bat": Stream("E4_Bat", "bat", 0, [1.0]),
@@ -50,40 +53,45 @@ STREAMS: Dict[str, Stream] = {
 
 
 class SubscriptionContext:
-    def __init__(self) -> None:
-        self.subscribed_to = []
-        self.paused = False
+    def __init__(self, r: StreamReader, w: StreamWriter) -> None:
+        self.r = r
+        self.w = w
         self.keepalive = True
+        self.subscriptions = []
+        self.paused = False
+        self.ctx_thread = Thread(target=self.create_streaming_loop)
+        self.ctx_thread.start()
 
     def subscribe(self, name: str):
-        if name not in self.subscribed_to:
-            self.subscribed_to.append(name)
+        if name not in self.subscriptions:
+            self.subscriptions.append(name)
         else:
-            logger.warn(f'attempt to resubscribe to {name}')
+            logger.warning(f'attempt to resubscribe to {name}')
 
     def unsubscribe(self, name: str):
-        if name in self.subscribed_to:
-            self.subscribed_to.remove(name)
+        if name in self.subscriptions:
+            self.subscriptions.remove(name)
         else:
-            logger.warn(f'attempt to unsubscribe from non-subscribed {name}')
+            logger.warning(f'attempt to unsubscribe from non-subscribed {name}')
 
     def end(self):
         self.keepalive = False
+        self.ctx_thread.join()
 
-    async def __task__(self, stream_id: str, w: StreamWriter):
+    async def __task__(self, stream_id: str):
         s = STREAMS[stream_id]
         while self.keepalive:
-            if not self.paused and s.type in self.subscribed_to:
+            if not self.paused and s.typ in self.subscriptions:
                 data = s.read_latest()
-                w.write(f"{data}\r\n".encode())
+                self.w.write(f"{data}\r\n".encode())
             await asyncio.sleep(1 / s.freq)
 
-    def create_streaming_loop(self, w: StreamWriter):
+    def create_streaming_loop(self):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         tasks = []
         for stream_id in STREAMS:
-            tasks.append(loop.create_task(self.__task__(stream_id, w)))
+            tasks.append(loop.create_task(self.__task__(stream_id)))
         loop.run_until_complete(asyncio.gather(*tasks, loop=loop, return_exceptions=True))
 
 
@@ -95,13 +103,13 @@ def cmd_handler(msg: str, ctx: SubscriptionContext) -> str:
     msg_parts = msg.split()
     cmd, args = msg_parts[0], msg_parts[1:]
 
-    if (cmd == "device_list"):
+    if cmd == "device_list":
         return "R device_list 2 | 9ff167 Empatica_E4 | 7a3166 Empatica_E4"
 
-    if (cmd == "device_connect"):
+    if cmd == "device_connect":
         return "R device_connect OK"
 
-    if (cmd == "device_subscribe"):
+    if cmd == "device_subscribe":
         if len(args) > 2:
             return "R device_subscribe ERR too many arguments"
         sub = args[0].lower()
@@ -109,7 +117,7 @@ def cmd_handler(msg: str, ctx: SubscriptionContext) -> str:
             ctx.subscribe(sub)
             return f"R {cmd} {sub} OK"
 
-    if (cmd == "device_unsubscribe"):
+    if cmd == "device_unsubscribe":
         if len(args) > 2:
             return "R device_unsubscribe ERR too many arguments"
         sub = args[0].lower()
@@ -117,7 +125,7 @@ def cmd_handler(msg: str, ctx: SubscriptionContext) -> str:
             ctx.unsubscribe(sub)
             return f"R {cmd} {sub} OK"
 
-    if (cmd == "pause"):
+    if cmd == "pause":
         if len(args) > 1:
             return "R pause ERR too many arguments"
         else:
@@ -139,9 +147,8 @@ def cmd_handler(msg: str, ctx: SubscriptionContext) -> str:
 
 async def ee4_srv(r: StreamReader, w: StreamWriter):
     logger.info(f"connection established")
-    ctx = SubscriptionContext()
-    ctx_thread = Thread(target=ctx.create_streaming_loop, args=(w,))
-    ctx_thread.start()
+    # create new context for client
+    ctx = SubscriptionContext(r, w)
     try:
         while not r.exception():
             msg_raw = await r.readline()
@@ -160,9 +167,6 @@ async def ee4_srv(r: StreamReader, w: StreamWriter):
     finally:
         logger.info("cleaning up resources")
         ctx.end()
-        ctx_thread.join()
-        del ctx
-        del ctx_thread
     logger.info(f"resources purged. connection terminated.")
 
 
@@ -176,6 +180,7 @@ async def main():
     except KeyboardInterrupt:
         await srv.wait_closed()
         exit(0)
+
 
 if (__name__ == "__main__"):
     # In try-except to suppress irrelevant errors
